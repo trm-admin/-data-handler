@@ -800,20 +800,20 @@ async def watch_handler(request: web.Request) -> web.Response:
                 return web.Response(status=400, text="Invalid domain parameter")
             target_domain = legacy_domain
 
-    # Dynamic forwarded links (with a domain param) use /dl/; manually
-    # registered links still go through the primary worker's /stream/.
     if target_domain:
-        # Dynamic forwarded links: /dl/ for streaming, /dl/?dl=1 for download.
-        # If the original link carried a query string (e.g. hash=...), keep it
-        # and append dl=1 with "&" instead of "?".
+        # Forwarded links now go THROUGH our Worker (/ext/), so the Worker can
+        # force the custom filename via Content-Disposition. The external
+        # domain stays hidden (base64) and the original query string (e.g.
+        # hash=...) is passed along as "oq".
         orig_query = (request.query.get("orig_query") or "").lstrip("?").strip()
-        base_stream = f"https://{target_domain}/dl/{short_id}"
+
+        ext_base = f"{WORKER_BASE_URL}/ext/{encode_domain(target_domain)}/{short_id}"
+        common = f"?name={urllib.parse.quote_plus(filename)}"
         if orig_query:
-            stream_url = f"{base_stream}?{orig_query}"
-            download_url = f"{base_stream}?{orig_query}&dl=1"
-        else:
-            stream_url = base_stream
-            download_url = f"{base_stream}?dl=1"
+            common += f"&oq={urllib.parse.quote_plus(orig_query)}"
+
+        stream_url = f"{ext_base}{common}"
+        download_url = f"{ext_base}{common}&dl=1"
     else:
         # Manual registered links use /stream/ for streaming, and ?dl=1 to
         # force a download disposition instead of inline playback.
@@ -821,7 +821,14 @@ async def watch_handler(request: web.Request) -> web.Response:
         download_url = f"{WORKER_BASE_URL}/stream/{short_id}?dl=1"
 
     try:
-        rendered = template % (filename, filename, stream_url, download_url, "Download")
+        # Values are HTML-escaped so a crafted ?name= can't inject markup.
+        rendered = template % (
+            html.escape(filename),
+            html.escape(filename),
+            html.escape(stream_url),
+            html.escape(download_url),
+            "Download",
+        )
     except TypeError as e:
         return web.Response(status=500, text=f"Template formatting error: {e}")
 
