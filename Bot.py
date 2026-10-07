@@ -174,6 +174,18 @@ async def set_webhook():
     logger.info(f"[WEBHOOK INFO] {info}")
 
 
+# ---------------- URL ENCODING ----------------
+
+def q(value: str) -> str:
+    """
+    Strict percent-encoding for query values AND path segments.
+    Spaces -> %20, ' -> %27, & -> %26, + -> %2B, etc. Nothing is left unescaped
+    except letters, digits and "_.-~", so names like "The Butcher's Blade.mkv"
+    survive every hop (Telegram -> Worker -> Render -> player).
+    """
+    return urllib.parse.quote(str(value), safe="")
+
+
 # ---------------- URL SHORTENING ----------------
 
 async def shrink_url(long_url: str) -> str:
@@ -562,7 +574,9 @@ async def handle_filetolink_message(message: dict):
     # --- File name cleaning (usernames -> blacklist -> tidy -> prefix) ---
     raw_file_name = extract_media_file_name(message) or DEFAULT_FALLBACK_FILENAME
     file_name = clean_file_name(raw_file_name, settings)
-    encoded_name = urllib.parse.quote_plus(file_name)
+
+    # Strict encoding: spaces -> %20, apostrophes -> %27, etc.
+    encoded_name = q(file_name)
 
     # Stealth mode: the external domain is never sent in plain text.
     b64_domain = encode_domain(extracted_domain)
@@ -575,7 +589,7 @@ async def handle_filetolink_message(message: dict):
 
     base_url = f"{WORKER_BASE_URL}/watch/{short_id}?name={encoded_name}&b64_domain={b64_domain}"
     if orig_query:
-        base_url += f"&orig_query={urllib.parse.quote_plus(orig_query)}"
+        base_url += f"&orig_query={q(orig_query)}"
 
     shortened_url = await shrink_url(base_url)
 
@@ -687,8 +701,8 @@ async def handle_message(message: dict):
                 await send_message(chat_id, f"Failed to register link: {e}")
             return
 
-        encoded_name = urllib.parse.quote_plus(filename)
-        # The Worker now proxies /watch/ (fetching dl.html from Render
+        encoded_name = q(filename)
+        # The Worker proxies /watch/ (fetching dl.html from Render
         # server-side), so the link handed to the user is the Worker's own
         # domain — Render is never exposed to the browser.
         watch_url = f"{WORKER_BASE_URL}/watch/{short_id}?name={encoded_name}"
@@ -701,7 +715,11 @@ async def handle_message(message: dict):
             "inline_keyboard": [[{"text": "▶️ Watch / Download", "url": watch_url}]]
         }
 
-        final_text = f"Your link is ready!\n\n<b>Filename:</b> {html.escape(filename)}\n<b>Link:</b> {shortened_url}"
+        final_text = (
+            f"Your link is ready!\n\n"
+            f"<b>Filename:</b> {html.escape(filename)}\n"
+            f"<b>Link:</b> {html.escape(shortened_url, quote=False)}"
+        )
         if status_message_id:
             await edit_message(chat_id, status_message_id, final_text, reply_markup)
         else:
@@ -775,8 +793,10 @@ async def watch_handler(request: web.Request) -> web.Response:
     if not short_id:
         return web.Response(status=400, text="Missing ID")
 
-    raw_name = request.query.get("name", "Video.mp4")
-    filename = urllib.parse.unquote_plus(raw_name)
+    # aiohttp has ALREADY percent-decoded request.query, so do NOT unquote
+    # again (a second decode corrupts names containing "%" or "+").
+    filename = request.query.get("name", "Video.mp4").strip() or "Video.mp4"
+    name_path = q(filename)  # safe path segment for the player-visible title
 
     try:
         with open(DL_HTML_PATH, "r", encoding="utf-8") as f:
@@ -801,24 +821,23 @@ async def watch_handler(request: web.Request) -> web.Response:
             target_domain = legacy_domain
 
     if target_domain:
-        # Forwarded links now go THROUGH our Worker (/ext/), so the Worker can
-        # force the custom filename via Content-Disposition. The external
-        # domain stays hidden (base64) and the original query string (e.g.
-        # hash=...) is passed along as "oq".
+        # Forwarded links go THROUGH our Worker (/ext/), so the Worker can
+        # force the custom filename via Content-Disposition. The name is also
+        # placed as the LAST PATH SEGMENT so VLC shows it instead of the ID.
         orig_query = (request.query.get("orig_query") or "").lstrip("?").strip()
 
-        ext_base = f"{WORKER_BASE_URL}/ext/{encode_domain(target_domain)}/{short_id}"
-        common = f"?name={urllib.parse.quote_plus(filename)}"
+        ext_base = f"{WORKER_BASE_URL}/ext/{encode_domain(target_domain)}/{short_id}/{name_path}"
+        params = []
         if orig_query:
-            common += f"&oq={urllib.parse.quote_plus(orig_query)}"
+            params.append(f"oq={q(orig_query)}")
 
-        stream_url = f"{ext_base}{common}"
-        download_url = f"{ext_base}{common}&dl=1"
+        stream_url = ext_base + ("?" + "&".join(params) if params else "")
+        download_url = ext_base + "?" + "&".join(params + ["dl=1"])
     else:
-        # Manual registered links use /stream/ for streaming, and ?dl=1 to
-        # force a download disposition instead of inline playback.
-        stream_url = f"{WORKER_BASE_URL}/stream/{short_id}"
-        download_url = f"{WORKER_BASE_URL}/stream/{short_id}?dl=1"
+        # Manual registered links: name in the path for VLC, ?dl=1 forces a
+        # download disposition instead of inline playback.
+        stream_url = f"{WORKER_BASE_URL}/stream/{short_id}/{name_path}"
+        download_url = f"{stream_url}?dl=1"
 
     try:
         # Values are HTML-escaped so a crafted ?name= can't inject markup.
