@@ -186,6 +186,26 @@
                 rgba(0,0,0,1) 100%%);
         }
     </style>
+    <!-- Audio-track gear menu. Re-uses Plyr's own menu classes so it inherits the existing skin.
+         NOTE: this page is a printf-style template, so no percent signs may be added below. -->
+    <style>
+        .adx-audio .plyr__menu__container { max-height: 170px; overflow-y: auto; }
+        .adx-audio .plyr__menu__container[hidden] { display: none; }
+        .adx-audio .adx-title,
+        .adx-audio .adx-status {
+            padding: 4px 10px;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            opacity: 0.75;
+            white-space: normal;
+            max-width: 220px;
+        }
+        .adx-audio .adx-status { text-transform: none; opacity: 0.9; letter-spacing: 0; }
+        .adx-audio .adx-status[hidden] { display: none; }
+        .adx-audio .adx-busy { opacity: 0.6; pointer-events: none; }
+    </style>
+    <!-- window.__AUDIO_META__ is injected here by the Worker (HTMLRewriter) -->
 </head>
 <body>
 
@@ -239,6 +259,650 @@
             const mxUrl = videoSrc.replace(/^https?:\/\//, '');
             document.getElementById('link-mx').href = "intent://" + mxUrl + "#Intent;package=com.mxtech.videoplayer.ad;type=video/*;scheme=https;end";
         });
+    </script>
+
+    <!-- ================= AUDIO TRACK MENU + LAZY AUDIO ENGINE (additive) ================= -->
+    <script>
+    (function () {
+        'use strict';
+
+        // ---------- Config ----------
+        // Script that defines window.AC3WasmDecoder (see adapter contract in the notes).
+        // Leave empty until you host one. It is ONLY downloaded when a user picks a track
+        // that needs it, never at page load.
+        var AC3_WASM_URL = '';
+        var MAX_AHEAD = 20;      // seconds of audio the engine may buffer ahead of the video
+        var LOOKAHEAD = 1.5;     // seconds scheduled into WebAudio ahead of the playhead
+        var DRIFT_MAX = 0.15;    // seconds of A/V drift tolerated before a resync
+
+        var META = window.__AUDIO_META__;
+        if (!META || !META.audio || !META.audio.length) return;   // no data -> page behaves exactly as before
+
+        var video = document.getElementById('main-video');
+        if (!video) return;
+        var tracks = META.audio;
+
+        // ---------- Labels ----------
+        function normCodec(c) {
+            c = String(c || '');
+            if (c.indexOf('A_AAC') === 0) return 'A_AAC';
+            if (c.indexOf('A_DTS') === 0) return 'A_DTS';
+            return c;
+        }
+        tracks.forEach(function (t) { t.codec = normCodec(t.codec); });
+
+        var CODEC_LABEL = { A_AC3: 'AC3', A_EAC3: 'EAC3', A_DTS: 'DTS', A_AAC: 'AAC', A_OPUS: 'Opus', A_VORBIS: 'Vorbis', A_FLAC: 'FLAC', 'A_MPEG/L3': 'MP3', A_TRUEHD: 'TrueHD' };
+        var CH_LABEL = { 1: 'Mono', 2: 'Stereo', 6: '5.1', 8: '7.1' };
+        var LANG_FALLBACK = { tam: 'Tamil', hin: 'Hindi', eng: 'English', tel: 'Telugu', mal: 'Malayalam', kan: 'Kannada', ben: 'Bengali', mar: 'Marathi', pan: 'Punjabi', urd: 'Urdu', jpn: 'Japanese', kor: 'Korean', fre: 'French', fra: 'French', ger: 'German', deu: 'German', spa: 'Spanish', chi: 'Chinese', zho: 'Chinese', rus: 'Russian', ara: 'Arabic', tha: 'Thai' };
+
+        function langName(code, fallbackIdx) {
+            code = String(code || '').toLowerCase();
+            if (!code || code === 'und') return 'Track ' + (fallbackIdx + 1);
+            try {
+                if (window.Intl && Intl.DisplayNames) {
+                    var n = new Intl.DisplayNames(['en'], { type: 'language' }).of(code);
+                    if (n && n.toLowerCase() !== code) return n;
+                }
+            } catch (e) { /* fall through */ }
+            return LANG_FALLBACK[code] || code.toUpperCase();
+        }
+        function trackLabel(t, i) {
+            var n = langName(t.lang, i);
+            if (t.name && (!t.lang || t.lang === 'und')) n = t.name;
+            return n;
+        }
+        function badgeText(t) {
+            var c = CODEC_LABEL[t.codec] || String(t.codec).replace(/^A_/, '');
+            return c + ' ' + (CH_LABEL[t.ch] || (t.ch + 'ch'));
+        }
+
+        var NATIVE_MIME = {
+            A_AC3: 'audio/mp4; codecs="ac-3"', A_EAC3: 'audio/mp4; codecs="ec-3"', A_AAC: 'audio/mp4; codecs="mp4a.40.2"',
+            A_OPUS: 'audio/webm; codecs="opus"', A_VORBIS: 'audio/webm; codecs="vorbis"', A_FLAC: 'audio/flac', 'A_MPEG/L3': 'audio/mpeg'
+        };
+        function isNative(t) {
+            var m = NATIVE_MIME[t.codec];
+            return !!m && video.canPlayType(m) !== '';
+        }
+
+        var baseIdx = 0;
+        for (var bi = 0; bi < tracks.length; bi++) { if (tracks[bi].def) { baseIdx = bi; break; } }
+        var current = baseIdx;
+
+        // Only worth showing a menu when there is a choice, or the only track cannot play natively.
+        if (tracks.length < 2 && isNative(tracks[0])) return;
+
+        // =====================================================================
+        // Minimal EBML helpers (client side, used for Cues + cluster demux)
+        // =====================================================================
+        function readId(buf, pos) {
+            if (pos >= buf.length) return null;
+            var b = buf[pos]; if (b === 0) return null;
+            var len = 1, mask = 0x80;
+            while (!(b & mask)) { len++; mask >>= 1; }
+            if (len > 4 || pos + len > buf.length) return null;
+            var v = 0;
+            for (var i = 0; i < len; i++) v = v * 256 + buf[pos + i];
+            return { len: len, value: v };
+        }
+        function readSize(buf, pos) {
+            if (pos >= buf.length) return null;
+            var b = buf[pos]; if (b === 0) return null;
+            var len = 1, mask = 0x80;
+            while (!(b & mask)) { len++; mask >>= 1; }
+            if (pos + len > buf.length) return null;
+            var v = b & (mask - 1), ones = (b & (mask - 1)) === (mask - 1);
+            for (var i = 1; i < len; i++) { var x = buf[pos + i]; v = v * 256 + x; if (x !== 0xFF) ones = false; }
+            return { len: len, value: ones ? -1 : v, unknown: ones };
+        }
+        function uint(buf, s, e) {
+            e = Math.min(e, buf.length);
+            var v = 0;
+            for (var i = s; i < e; i++) v = v * 256 + buf[i];
+            return v;
+        }
+        function* children(buf, start, end) {
+            var pos = start;
+            end = Math.min(end, buf.length);
+            while (pos < end) {
+                var id = readId(buf, pos); if (!id) return;
+                var sz = readSize(buf, pos + id.len); if (!sz) return;
+                var ds = pos + id.len + sz.len;
+                var de = sz.unknown ? Infinity : ds + sz.value;
+                yield { id: id.value, ds: ds, de: de, unknown: sz.unknown };
+                if (sz.unknown) return;
+                pos = de;
+            }
+        }
+        function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+        function b64ToBytes(b64) {
+            var s = atob(b64), a = new Uint8Array(s.length);
+            for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+            return a;
+        }
+
+        // =====================================================================
+        // Audio engine: demux one audio track from the MKV, decode it, play it
+        // through WebAudio in sync with the (otherwise unchanged) video element.
+        // Nothing here runs until the user picks a track that needs it.
+        // =====================================================================
+        var url = video.querySelector('source') ? video.querySelector('source').src : video.currentSrc;
+        var ctx = null, mediaSrc = null, nativeGain = null, extGain = null;
+        var active = false, track = null, gen = 0, decoder = null;
+        var pending = [], scheduled = [], expected = null, lastTs = 0;
+        var timer = null, seekTimer = null, demuxCtrl = null, lastResync = 0, cues = null, warnedLacing = false;
+        var statusCb = function () {};
+
+        function ensureCtx() {
+            if (ctx) return;
+            var AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) throw new Error('Web Audio is not supported in this browser');
+            ctx = new AC();
+            // Route the video's own audio through the graph so it can be silenced
+            // without touching video.muted (Plyr's volume UI keeps working).
+            mediaSrc = ctx.createMediaElementSource(video);
+            nativeGain = ctx.createGain();
+            extGain = ctx.createGain();
+            mediaSrc.connect(nativeGain);
+            nativeGain.connect(ctx.destination);
+            extGain.connect(ctx.destination);
+            extGain.gain.value = 0;
+        }
+        function syncVolume() {
+            if (!ctx) return;
+            extGain.gain.value = video.muted ? 0 : video.volume;
+        }
+        video.addEventListener('volumechange', syncVolume);
+
+        async function rangeBytes(from, to) {
+            var res = await fetch(url, { headers: { 'Range': 'bytes=' + from + '-' + to } });
+            if (res.status !== 206) { try { res.body && res.body.cancel(); } catch (e) {} return null; }
+            return new Uint8Array(await res.arrayBuffer());
+        }
+
+        async function loadCues() {
+            if (cues) return;
+            cues = [];
+            if (META.cues === null || META.cues === undefined || META.seg === null || META.seg === undefined) return;
+            var start = META.seg + META.cues;
+            var buf = await rangeBytes(start, start + 65535);
+            if (!buf) return;
+            var id = readId(buf, 0), sz = id && readSize(buf, id.len);
+            if (!id || id.value !== 0x1C53BB6B || !sz || sz.unknown) return;
+            var total = id.len + sz.len + sz.value;
+            if (total > 4 * 1024 * 1024) return;
+            if (total > buf.length) { buf = await rangeBytes(start, start + total - 1); if (!buf) return; }
+            var scale = META.ts || 1000000;
+            for (var cp of children(buf, id.len + sz.len, id.len + sz.len + sz.value)) {
+                if (cp.id !== 0xBB) continue;                       // CuePoint
+                var time = null, pos = null;
+                for (var x of children(buf, cp.ds, cp.de)) {
+                    if (x.id === 0xB3) time = uint(buf, x.ds, x.de);                       // CueTime
+                    else if (x.id === 0xB7 && pos === null) {                               // CueTrackPositions
+                        for (var y of children(buf, x.ds, x.de)) if (y.id === 0xF1) pos = uint(buf, y.ds, y.de); // CueClusterPosition
+                    }
+                }
+                if (time !== null && pos !== null) cues.push({ t: time * scale / 1e9, pos: pos });
+            }
+            cues.sort(function (a, b) { return a.t - b.t; });
+        }
+        function cueFor(t) {
+            var lo = 0, hi = cues.length - 1, r = -1;
+            while (lo <= hi) {
+                var m = (lo + hi) >> 1;
+                if (cues[m].t <= t) { r = m; lo = m + 1; } else hi = m - 1;
+            }
+            return r < 0 ? cues[0] : cues[r];
+        }
+
+        // ---------- Decoders ----------
+        function toStereo(planes) {
+            var c = planes.length;
+            if (c === 1) return [planes[0], planes[0]];
+            if (c === 2) return planes;
+            var n = planes[0].length, L = new Float32Array(n), R = new Float32Array(n);
+            var k = 0.7071, norm = 1 / (1 + 2 * k);
+            // Channel order: FL FR FC LFE BL BR (SL SR). LFE is dropped in the downmix.
+            var C = -1, SL = -1, SR = -1, SL2 = -1, SR2 = -1;
+            if (c >= 6) { C = 2; SL = 4; SR = 5; if (c >= 8) { SL2 = 6; SR2 = 7; } }
+            else if (c === 5) { C = 2; SL = 3; SR = 4; }
+            else if (c === 4) { SL = 2; SR = 3; }
+            else if (c === 3) { C = 2; }
+            for (var i = 0; i < n; i++) {
+                var l = planes[0][i], r = planes[1][i];
+                if (C >= 0) { var cc = planes[C][i] * k; l += cc; r += cc; }
+                if (SL >= 0) { l += planes[SL][i] * k; r += planes[SR][i] * k; }
+                if (SL2 >= 0) { l += planes[SL2][i] * k; r += planes[SR2][i] * k; }
+                L[i] = l * norm; R[i] = r * norm;
+            }
+            return [L, R];
+        }
+
+        function webCodecsDecoder(cfg, onOut) {
+            var dec = null;
+            function open() {
+                dec = new AudioDecoder({
+                    output: function (ad) {
+                        var planes = [];
+                        for (var i = 0; i < ad.numberOfChannels; i++) {
+                            var a = new Float32Array(ad.numberOfFrames);
+                            ad.copyTo(a, { planeIndex: i, format: 'f32-planar' });
+                            planes.push(a);
+                        }
+                        var out = { planes: planes, sampleRate: ad.sampleRate, ts: ad.timestamp / 1e6 };
+                        ad.close();
+                        onOut(out);
+                    },
+                    error: function (e) { console.warn('AudioDecoder error', e); }
+                });
+                dec.configure(cfg);
+            }
+            open();
+            return {
+                push: function (bytes, ts) {
+                    if (dec.state === 'closed') return;
+                    dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1e6), data: bytes }));
+                },
+                busy: function () { return dec.decodeQueueSize > 40; },
+                reset: function () { try { dec.close(); } catch (e) {} open(); },
+                close: function () { try { dec.close(); } catch (e) {} }
+            };
+        }
+
+        var wasmLoading = null;
+        function loadScriptOnce(src) {
+            if (wasmLoading) return wasmLoading;
+            wasmLoading = new Promise(function (resolve, reject) {
+                var s = document.createElement('script');
+                s.src = src; s.async = true;
+                s.onload = resolve;
+                s.onerror = function () { wasmLoading = null; reject(new Error('Could not load the audio decoder')); };
+                document.head.appendChild(s);
+            });
+            return wasmLoading;
+        }
+
+        // Adapter contract for window.AC3WasmDecoder:
+        //   await AC3WasmDecoder.create({ codec, channels, sampleRate }) -> inst
+        //   inst.decode(Uint8Array frameBytes, tsSeconds) -> { sampleRate, planes: Float32Array[] } | null   (may be a Promise)
+        //   inst.reset?()  inst.close?()
+        async function wasmDecoder(t, onOut) {
+            if (!AC3_WASM_URL) throw new Error('This audio format needs a decoder that is not configured');
+            await loadScriptOnce(AC3_WASM_URL);
+            var api = window.AC3WasmDecoder;
+            if (!api || typeof api.create !== 'function') throw new Error('Audio decoder failed to initialise');
+            var inst = await api.create({ codec: t.codec, channels: t.ch, sampleRate: t.sr });
+            return {
+                push: function (bytes, ts) {
+                    Promise.resolve(inst.decode(bytes, ts)).then(function (r) {
+                        if (r && r.planes && r.planes.length) onOut({ planes: r.planes, sampleRate: r.sampleRate, ts: ts });
+                    }).catch(function (e) { console.warn('decode error', e); });
+                },
+                busy: function () { return false; },
+                reset: function () { if (inst.reset) inst.reset(); },
+                close: function () { if (inst.close) inst.close(); }
+            };
+        }
+
+        async function makeDecoder(t, onOut) {
+            var map = { A_AAC: 'mp4a.40.2', A_OPUS: 'opus', A_VORBIS: 'vorbis', A_FLAC: 'flac', 'A_MPEG/L3': 'mp3', A_AC3: 'ac-3', A_EAC3: 'ec-3' };
+            var wc = map[t.codec];
+            if (wc && window.AudioDecoder && window.EncodedAudioChunk) {
+                var cfg = { codec: wc, sampleRate: t.sr || 48000, numberOfChannels: t.ch || 2 };
+                if (t.cp) cfg.description = b64ToBytes(t.cp);
+                try {
+                    var s = await AudioDecoder.isConfigSupported(cfg);
+                    if (s && s.supported) return webCodecsDecoder(cfg, onOut);
+                } catch (e) { /* use the WASM path */ }
+            }
+            return wasmDecoder(t, onOut);
+        }
+
+        // ---------- Playback scheduling ----------
+        function onOut(o) {
+            if (!active || !ctx) return;
+            var st = toStereo(o.planes), n = st[0].length;
+            if (!n) return;
+            var buf = ctx.createBuffer(2, n, o.sampleRate);
+            buf.copyToChannel(st[0], 0);
+            buf.copyToChannel(st[1], 1);
+            var mt = o.ts;
+            if (expected !== null && Math.abs(mt - expected) < 0.1) mt = expected;
+            expected = mt + buf.duration;
+            pending.push({ mt: mt, buf: buf });
+        }
+
+        function stopScheduled(requeue) {
+            var back = [];
+            for (var i = 0; i < scheduled.length; i++) {
+                var r = scheduled[i];
+                r.node.onended = null;
+                try { r.node.stop(); } catch (e) {}
+                try { r.node.disconnect(); } catch (e) {}
+                back.push(r.it);
+            }
+            scheduled = [];
+            if (requeue) pending = back.concat(pending);
+        }
+
+        function pump() {
+            if (!active || !ctx) return;
+            var vt = video.currentTime, now = ctx.currentTime;
+            var playing = !video.paused && !video.seeking && video.readyState >= 3 && ctx.state === 'running';
+            if (!playing) { if (scheduled.length) stopScheduled(true); return; }
+
+            while (pending.length && pending[0].mt + pending[0].buf.duration < vt - 0.05) pending.shift();
+
+            var outLat = ctx.outputLatency || ctx.baseLatency || 0;
+
+            // Drift check against the buffer that should be sounding right now.
+            if (performance.now() - lastResync > 1500) {
+                for (var i = 0; i < scheduled.length; i++) {
+                    var r = scheduled[i];
+                    if (r.when <= now && r.when + r.it.buf.duration - r.off > now) {
+                        var audioPos = r.it.mt + r.off + (now - r.when);
+                        if (Math.abs(audioPos - vt - outLat) > DRIFT_MAX) {
+                            lastResync = performance.now();
+                            stopScheduled(true);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            while (pending.length && pending[0].mt < vt + LOOKAHEAD) {
+                var it = pending.shift();
+                var startAt = now + (it.mt - vt) - outLat;
+                if (startAt + it.buf.duration <= now) continue;
+                var off = 0, when = startAt;
+                if (startAt < now) { off = now - startAt; when = now; }
+                var node = ctx.createBufferSource();
+                node.buffer = it.buf;
+                node.connect(extGain);
+                node.start(when, off);
+                var rec = { it: it, node: node, when: when, off: off };
+                node.onended = (function (rr) {
+                    return function () {
+                        var k = scheduled.indexOf(rr);
+                        if (k >= 0) scheduled.splice(k, 1);
+                    };
+                })(rec);
+                scheduled.push(rec);
+            }
+        }
+
+        // ---------- Demux ----------
+        async function demuxLoop(pos, synced, g) {
+            var ctrl = new AbortController();
+            demuxCtrl = ctrl;
+            var res = await fetch(url, { headers: { 'Range': 'bytes=' + pos + '-' }, signal: ctrl.signal });
+            if (!(res.status === 206 || (res.status === 200 && pos === 0))) {
+                try { res.body && res.body.cancel(); } catch (e) {}
+                throw new Error('Server refused the audio range request');
+            }
+            var reader = res.body.getReader();
+            var scale = META.ts || 1000000;
+            var wantTrack = track.id;
+            var buf = new Uint8Array(0), p = 0, skip = 0, clusterTc = 0;
+
+            for (;;) {
+                if (g !== gen) { ctrl.abort(); return; }
+                while (active && g === gen && ((lastTs - video.currentTime) > MAX_AHEAD || decoder.busy())) await sleep(250);
+                if (g !== gen) { ctrl.abort(); return; }
+
+                var chunk = await reader.read();
+                if (chunk.done) return;
+
+                var rest = buf.subarray(p);
+                var merged = new Uint8Array(rest.length + chunk.value.length);
+                merged.set(rest, 0);
+                merged.set(chunk.value, rest.length);
+                buf = merged; p = 0;
+
+                for (;;) {
+                    if (skip > 0) {
+                        var n = Math.min(skip, buf.length - p);
+                        p += n; skip -= n;
+                        if (skip > 0) break;
+                    }
+                    if (!synced) {
+                        var found = -1;
+                        for (var q = p; q + 3 < buf.length; q++) {
+                            if (buf[q] === 0x1F && buf[q + 1] === 0x43 && buf[q + 2] === 0xB6 && buf[q + 3] === 0x75) { found = q; break; }
+                        }
+                        if (found < 0) { p = Math.max(p, buf.length - 3); break; }
+                        p = found; synced = true;
+                    }
+                    var id = readId(buf, p); if (!id) break;
+                    var sz = readSize(buf, p + id.len); if (!sz) break;
+                    var hdr = id.len + sz.len;
+
+                    if (id.value === 0x1F43B675 || id.value === 0xA0) { p += hdr; continue; }   // Cluster / BlockGroup: descend
+                    if (id.value === 0xE7) {                                                      // Cluster Timecode
+                        if (sz.unknown || buf.length - p < hdr + sz.value) break;
+                        clusterTc = uint(buf, p + hdr, p + hdr + sz.value);
+                        p += hdr + sz.value; continue;
+                    }
+                    if (id.value === 0xA3 || id.value === 0xA1) {                                 // SimpleBlock / Block
+                        if (sz.unknown) { p += hdr; continue; }
+                        var total = hdr + sz.value;
+                        var peek = Math.min(total, hdr + 8);
+                        if (buf.length - p < peek) break;
+                        var tr = readSize(buf, p + hdr);
+                        if (!tr) { p += hdr; skip = sz.value; continue; }
+                        if (tr.value !== wantTrack) { p += hdr; skip = sz.value; continue; }
+                        if (buf.length - p < total) break;
+                        var h = p + hdr + tr.len;
+                        var rel = (buf[h] << 8) | buf[h + 1];
+                        if (rel & 0x8000) rel -= 0x10000;
+                        var flags = buf[h + 2];
+                        if ((flags >> 1) & 3) {
+                            if (!warnedLacing) { warnedLacing = true; console.warn('Laced audio blocks are not supported'); }
+                        } else {
+                            var ts = (clusterTc + rel) * scale / 1e9;
+                            lastTs = ts;
+                            decoder.push(buf.slice(h + 3, p + total), ts);
+                        }
+                        p += total; continue;
+                    }
+                    if (sz.unknown) { p += hdr; continue; }
+                    p += hdr; skip = sz.value;                                                    // anything else: skip
+                }
+            }
+        }
+
+        async function runFrom(t, g) {
+            var pos = 0, synced = true;
+            if (cues && cues.length) {
+                pos = META.seg + cueFor(t).pos;
+            } else if (t > 1 && META.size && META.dur) {
+                pos = Math.floor(META.size * (t / META.dur)); synced = false;
+            } else {
+                pos = META.seg || 0;
+            }
+            lastTs = t;
+            try {
+                await demuxLoop(pos, synced, g);
+            } catch (e) {
+                if (g === gen && !(e && e.name === 'AbortError')) {
+                    console.warn(e);
+                    statusCb('Audio stream interrupted. Re-select the track to retry.', true);
+                }
+            }
+        }
+
+        function abortDemux() { try { demuxCtrl && demuxCtrl.abort(); } catch (e) {} demuxCtrl = null; }
+
+        function restartAt(t) {
+            if (!active) return;
+            gen++;
+            abortDemux();
+            stopScheduled(false);
+            pending = []; expected = null;
+            try { decoder.reset(); } catch (e) {}
+            runFrom(t, gen);
+        }
+
+        video.addEventListener('seeking', function () {
+            if (!active) return;
+            stopScheduled(false);
+            pending = []; expected = null;
+            clearTimeout(seekTimer);
+            seekTimer = setTimeout(function () { restartAt(video.currentTime); }, 200);
+        });
+
+        function engineStop() {
+            gen++;
+            abortDemux();
+            clearInterval(timer); timer = null;
+            clearTimeout(seekTimer);
+            if (ctx) { stopScheduled(false); nativeGain.gain.value = 1; extGain.gain.value = 0; }
+            pending = []; expected = null;
+            if (decoder) { try { decoder.close(); } catch (e) {} decoder = null; }
+            active = false; track = null;
+        }
+
+        async function engineStart(t) {
+            ensureCtx();
+            await ctx.resume();
+            statusCb('Loading audio…', false);
+            var dec = await makeDecoder(t, onOut);      // may throw: nothing has been changed yet
+            try {
+                await loadCues();
+            } catch (e) { cues = []; }
+            engineStop();                               // tear down any previous track
+            decoder = dec; track = t; active = true;
+            nativeGain.gain.value = 0;                  // silence the video's own audio
+            syncVolume();
+            timer = setInterval(pump, 100);
+            runFrom(video.currentTime, gen);
+        }
+
+        window.addEventListener('pagehide', function () { abortDemux(); });
+
+        // =====================================================================
+        // Track switching
+        // =====================================================================
+        async function switchTo(i) {
+            var t = tracks[i];
+            var nat = video.audioTracks;
+            if (nat && nat.length === tracks.length) {          // browsers that expose native audio tracks
+                for (var k = 0; k < nat.length; k++) nat[k].enabled = (k === i);
+                engineStop();
+                return;
+            }
+            if (i === baseIdx && isNative(t)) { engineStop(); return; }   // the track the browser plays by itself
+            await engineStart(t);
+        }
+
+        // =====================================================================
+        // Gear menu (built from Plyr's own classes, so it matches the existing skin)
+        // =====================================================================
+        function waitFor(sel, tries, cb) {
+            var el = document.querySelector(sel);
+            if (el) return cb(el);
+            if (tries <= 0) return;
+            setTimeout(function () { waitFor(sel, tries - 1, cb); }, 100);
+        }
+
+        function buildMenu(controls) {
+            var wrap = document.createElement('div');
+            wrap.className = 'plyr__controls__item plyr__menu adx-audio';
+            wrap.innerHTML =
+                '<button class="plyr__control" type="button" aria-haspopup="true" aria-expanded="false">' +
+                '<svg aria-hidden="true" focusable="false"><use href="#plyr-settings" xlink:href="#plyr-settings"></use></svg>' +
+                '<span class="plyr__sr-only">Audio</span></button>' +
+                '<div class="plyr__menu__container" hidden><div><div role="menu">' +
+                '<div class="adx-title">Audio</div><div class="adx-status" hidden></div>' +
+                '</div></div></div>';
+
+            var btn = wrap.querySelector('button.plyr__control');
+            var box = wrap.querySelector('.plyr__menu__container');
+            var menu = wrap.querySelector('[role="menu"]');
+            var statusEl = wrap.querySelector('.adx-status');
+            var items = [];
+            var busy = false, statusTimer = null;
+
+            function setStatus(text, autoClear) {
+                clearTimeout(statusTimer);
+                statusEl.textContent = text || '';
+                statusEl.hidden = !text;
+                if (text && autoClear) statusTimer = setTimeout(function () { setStatus(''); }, 5000);
+            }
+            statusCb = setStatus;
+
+            function setChecked(idx) {
+                items.forEach(function (b, k) { b.setAttribute('aria-checked', k === idx ? 'true' : 'false'); });
+            }
+            function openMenu(open) {
+                box.hidden = !open;
+                btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+            }
+
+            tracks.forEach(function (t, i) {
+                var b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'plyr__control';
+                b.setAttribute('role', 'menuitemradio');
+                b.setAttribute('aria-checked', i === current ? 'true' : 'false');
+                var label = document.createElement('span');
+                label.textContent = trackLabel(t, i);
+                var val = document.createElement('span');
+                val.className = 'plyr__menu__value';
+                var badge = document.createElement('span');
+                badge.className = 'plyr__badge';
+                badge.textContent = badgeText(t);
+                val.appendChild(badge);
+                label.appendChild(val);
+                b.appendChild(label);
+                b.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    pick(i);
+                });
+                menu.appendChild(b);
+                items.push(b);
+            });
+
+            async function pick(i) {
+                if (busy) return;
+                if (i === current) { openMenu(false); return; }
+                busy = true;
+                wrap.classList.add('adx-busy');
+                try {
+                    await switchTo(i);
+                    current = i;
+                    setChecked(i);
+                    setStatus('');
+                    openMenu(false);
+                } catch (e) {
+                    console.warn(e);
+                    setStatus((e && e.message) ? e.message : 'Could not switch audio', true);
+                } finally {
+                    busy = false;
+                    wrap.classList.remove('adx-busy');
+                }
+            }
+
+            if (!isNative(tracks[baseIdx]) && !(video.audioTracks && video.audioTracks.length)) {
+                setStatus('This browser may not play the default audio format. Pick a track to enable sound.', false);
+            }
+
+            btn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                openMenu(box.hidden);
+            });
+            box.addEventListener('click', function (e) { e.stopPropagation(); });
+            document.addEventListener('click', function () { if (!box.hidden) openMenu(false); });
+            document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !box.hidden) openMenu(false); });
+
+            var fs = controls.querySelector('[data-plyr="fullscreen"]');
+            if (fs) controls.insertBefore(wrap, fs); else controls.appendChild(wrap);
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            waitFor('.plyr__controls', 50, buildMenu);
+        });
+    })();
     </script>
 </body>
 </html>
