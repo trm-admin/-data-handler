@@ -521,24 +521,63 @@ async def send_settings_menu(chat_id: int, user_id: int):
 
 # ---------------- LINK MANAGEMENT (DELETE / TIMER) ----------------
 
-def link_buttons(watch_url: str, short_id: str) -> dict:
-    """Watch button on top, Delete + Timer side by side below it."""
-    return {
-        "inline_keyboard": [
-            [{"text": "▶️ Watch / Download", "url": watch_url}],
-            [
-                {"text": "🗑 Delete", "callback_data": f"{CB_DELETE_PREFIX}{short_id}"},
-                {"text": "⏳ Timer", "callback_data": f"{CB_TIMER_PREFIX}{short_id}"},
-            ],
-        ]
-    }
+def link_buttons(url: str, label: str, short_id: str, owner: int | None) -> dict:
+    """
+    Watch button on top, Delete + Timer side by side below it.
+    The owner's Telegram id is embedded in callback_data so the bot can reject
+    other people's clicks (in groups) before touching the Worker.
+    """
+    rows = [[{"text": label, "url": url}]]
+
+    if owner is not None:
+        delete_cb = f"{CB_DELETE_PREFIX}{owner}:{short_id}"
+        timer_cb = f"{CB_TIMER_PREFIX}{owner}:{short_id}"
+        longest_cb = f"{CB_TIMER_UNIT_PREFIX}h:{owner}:{short_id}"
+
+        # Telegram limits callback_data to 64 bytes; very long external ids can exceed it.
+        if len(longest_cb.encode("utf-8")) <= 64:
+            rows.append(
+                [
+                    {"text": "🗑 Delete", "callback_data": delete_cb},
+                    {"text": "⏳ Timer", "callback_data": timer_cb},
+                ]
+            )
+        else:
+            logger.warning(f"[BUTTONS] id too long for callback_data, Delete/Timer skipped: {short_id}")
+
+    return {"inline_keyboard": rows}
+
+
+def parse_link_ref(rest: str) -> tuple[str | None, str]:
+    """
+    callback_data tail -> (owner_id_or_None, link_id).
+    New format "<owner>:<id>"; legacy format "<id>" (no owner embedded).
+    Link ids never contain ":" so splitting on the first one is safe.
+    """
+    if ":" in rest:
+        owner, link_id = rest.split(":", 1)
+        return owner, link_id
+    return None, rest
+
+
+def owner_matches(owner_hint: str | None, user_id: int) -> bool:
+    return owner_hint is None or owner_hint == str(user_id)
 
 
 async def handle_delete_callback(
-    callback_id: str | None, user_id: int, chat_id: int, message_id: int | None, link_id: str
+    callback_id: str | None,
+    user_id: int,
+    chat_id: int,
+    message_id: int | None,
+    link_id: str,
+    owner_hint: str | None = None,
 ):
     if not LINK_ID_REGEX.fullmatch(link_id):
         await answer_callback(callback_id, "Invalid link.", alert=True)
+        return
+
+    if not owner_matches(owner_hint, user_id):
+        await answer_callback(callback_id, "⛔ Only the person who created this link can delete it.", alert=True)
         return
 
     try:
@@ -625,26 +664,32 @@ async def handle_callback_query(callback_query: dict):
 
     # ----- Delete -----
     if data.startswith(CB_DELETE_PREFIX):
+        owner_hint, link_id = parse_link_ref(data[len(CB_DELETE_PREFIX):])
         await handle_delete_callback(
-            callback_id, user_id, chat_id, message_id, data[len(CB_DELETE_PREFIX):]
+            callback_id, user_id, chat_id, message_id, link_id, owner_hint
         )
         return
 
     # ----- Timer: step 1 (ask Hours or Days) -----
     if data.startswith(CB_TIMER_PREFIX):
-        link_id = data[len(CB_TIMER_PREFIX):]
+        owner_hint, link_id = parse_link_ref(data[len(CB_TIMER_PREFIX):])
         if not LINK_ID_REGEX.fullmatch(link_id):
             await answer_callback(callback_id, "Invalid link.", alert=True)
             return
+        if not owner_matches(owner_hint, user_id):
+            await answer_callback(callback_id, "⛔ Only the person who created this link can set a timer.", alert=True)
+            return
         await answer_callback(callback_id)
+
+        owner_part = f"{owner_hint}:" if owner_hint is not None else ""
         await send_message(
             chat_id,
             "⏳ <b>Auto-delete timer</b>\n\nHours or Days?",
             {
                 "inline_keyboard": [
                     [
-                        {"text": "🕐 Hours", "callback_data": f"{CB_TIMER_UNIT_PREFIX}h:{link_id}"},
-                        {"text": "📅 Days", "callback_data": f"{CB_TIMER_UNIT_PREFIX}d:{link_id}"},
+                        {"text": "🕐 Hours", "callback_data": f"{CB_TIMER_UNIT_PREFIX}h:{owner_part}{link_id}"},
+                        {"text": "📅 Days", "callback_data": f"{CB_TIMER_UNIT_PREFIX}d:{owner_part}{link_id}"},
                     ]
                 ]
             },
@@ -654,11 +699,19 @@ async def handle_callback_query(callback_query: dict):
     # ----- Timer: step 2 (unit chosen, now wait for the number) -----
     if data.startswith(CB_TIMER_UNIT_PREFIX):
         parts = data[len(CB_TIMER_UNIT_PREFIX):].split(":", 1)
-        if len(parts) != 2 or parts[0] not in ("h", "d") or not LINK_ID_REGEX.fullmatch(parts[1]):
+        if len(parts) != 2 or parts[0] not in ("h", "d"):
             await answer_callback(callback_id, "Invalid request.", alert=True)
             return
 
-        unit, link_id = parts
+        unit = parts[0]
+        owner_hint, link_id = parse_link_ref(parts[1])
+        if not LINK_ID_REGEX.fullmatch(link_id):
+            await answer_callback(callback_id, "Invalid request.", alert=True)
+            return
+        if not owner_matches(owner_hint, user_id):
+            await answer_callback(callback_id, "⛔ Only the person who created this link can set a timer.", alert=True)
+            return
+
         await answer_callback(callback_id)
 
         pending_urls.pop(user_id, None)
@@ -789,10 +842,11 @@ async def handle_filetolink_message(message: dict):
       - swaps ONLY the matched link for the shortened URL; the rest of the
         caption/message text is kept exactly as received (no cleaning),
       - reposts the payload (copying media, or sending plain text) with an
-        inline "Watch online & Download" button.
+        inline "Watch online & Download" button plus Delete / Timer buttons.
 
-    NOTE: these links live on the external server, not in the Worker's KV
-    database, so there is nothing for Delete / Timer buttons to act on here.
+    These links live on the external server, not in the Worker's KV database,
+    so Delete / Timer create an override record in the Worker that makes its
+    /ext/ proxy refuse the link (see handleDelete / handleTtl in worker.js).
     """
     chat = message.get("chat", {})
     chat_id = chat.get("id")
@@ -844,9 +898,9 @@ async def handle_filetolink_message(message: dict):
     after_link = html.escape(original_text[match.end():])
     new_text = f"{before_link}{html.escape(shortened_url, quote=False)}{after_link}"
 
-    reply_markup = {
-        "inline_keyboard": [[{"text": "Watch online & Download", "url": base_url}]]
-    }
+    # Delete / Timer act on an "ext_meta:<id>" override record in the Worker,
+    # because these links are not stored in KV.
+    reply_markup = link_buttons(base_url, "Watch online & Download", short_id, user_id)
 
     if is_media:
         await copy_message(
@@ -972,7 +1026,7 @@ async def handle_message(message: dict):
         # button below keeps the direct Worker watch_url.
         shortened_url = await shrink_url(watch_url)
 
-        reply_markup = link_buttons(watch_url, short_id)
+        reply_markup = link_buttons(watch_url, "▶️ Watch / Download", short_id, user_id)
 
         final_text = (
             f"Your link is ready!\n\n"
