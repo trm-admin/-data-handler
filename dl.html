@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>%s</title>
     <link rel="stylesheet" href="https://cdn.plyr.io/3.6.12/plyr.css" />
     <style>
@@ -186,6 +186,410 @@
                 rgba(0,0,0,1) 100%%);
         }
     </style>
+    <!-- Engine player additions (zoom / lock / subtitles / audio shield / debug panel). Old rules above are untouched. -->
+    <style>
+        .player-placeholder { position: relative; }
+        .plyr { width: 100%%; height: 100%%; position: relative; overflow: hidden; }
+        [data-plyr="download"], [data-plyr="rewind"], [data-plyr="fast-forward"] { display: none !important; }
+
+        /* ---------------------------------------------------------------
+           VIDEO FIT MODES
+           Default is ALWAYS Original Fit (object-fit: contain).
+           Zoom modes only apply while .trm-fs-active is on the player and
+           only after the user presses the Zoom button.
+           --------------------------------------------------------------- */
+        .plyr .plyr__video-wrapper {
+            width: 100%% !important;
+            height: 100%% !important;
+        }
+        .plyr video {
+            width: 100%% !important;
+            height: 100%% !important;
+            object-fit: contain;
+            object-position: center center;
+        }
+
+        /* Zoom Fill / Full Stretch: the whole player is pinned to the real viewport */
+        .plyr.trm-fs-active.trm-zoom-fill,
+        .plyr.trm-fs-active.trm-zoom-stretch {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            max-width: none !important;
+            max-height: none !important;
+            margin: 0 !important;
+            border-radius: 0 !important;
+            background: #000;
+            z-index: 2147483000;
+        }
+        @supports (height: 100dvh) {
+            .plyr.trm-fs-active.trm-zoom-fill,
+            .plyr.trm-fs-active.trm-zoom-stretch {
+                height: 100dvh !important;
+            }
+        }
+
+        /* Zoom Fill / Full Stretch: wrapper breaks out of the 16:9 box */
+        .plyr.trm-fs-active.trm-zoom-fill .plyr__video-wrapper,
+        .plyr.trm-fs-active.trm-zoom-stretch .plyr__video-wrapper {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: 100%% !important;
+            height: 100%% !important;
+            max-width: none !important;
+            max-height: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            background: #000 !important;
+        }
+        /* CSS-only baseline (JS then refines with exact scale transforms) */
+        .plyr.trm-fs-active.trm-zoom-fill video {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100%% !important;
+            height: 100%% !important;
+            max-width: none !important;
+            max-height: none !important;
+            object-fit: cover !important;
+        }
+        .plyr.trm-fs-active.trm-zoom-stretch video {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100%% !important;
+            height: 100%% !important;
+            max-width: none !important;
+            max-height: none !important;
+            object-fit: fill !important;
+        }
+
+        /* Zoom Mode Toast Indicator */
+        .trm-zoom-toast {
+            position: absolute;
+            top: 22px;
+            left: 50%%;
+            transform: translateX(-50%%);
+            z-index: 38;
+            background: rgba(12, 16, 26, 0.85);
+            border: 1px solid rgba(0, 229, 255, 0.45);
+            color: #00e5ff;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 5px 14px;
+            border-radius: 20px;
+            pointer-events: none;
+            opacity: 0;
+            white-space: nowrap;
+            transition: opacity 0.2s ease;
+        }
+        .trm-zoom-toast.is-show {
+            opacity: 1;
+        }
+
+        /* Zoom / Aspect Button in Control Bar (shown only while .trm-fs-active) */
+        .trm-zoom-ctrl {
+            display: none;
+        }
+        .plyr.trm-fs-active .trm-zoom-ctrl {
+            display: inline-flex;
+        }
+
+        /* ---------------------------------------------------------------
+           SUBTITLE OVERLAY
+           Pinned to the player container (NOT to the video element), so the
+           fit / zoom mode can never move it.
+
+           Windowed:    controls hidden = 10px, controls visible = 42px
+           Fullscreen:  controls hidden / screen locked = 14px
+                        controls visible = 48px (just above the control bar)
+           --------------------------------------------------------------- */
+        .trm-sub-overlay {
+            position: absolute;
+            left: 5%%;
+            right: 5%%;
+            bottom: 10px !important;
+            z-index: 30;
+            text-align: center;
+            pointer-events: none;
+            display: flex;
+            justify-content: center;
+            align-items: flex-end;
+        }
+        .plyr:not(.plyr--hide-controls) .trm-sub-overlay {
+            bottom: 42px !important;
+        }
+        .plyr.trm-fs-active .trm-sub-overlay,
+        .plyr--fullscreen-active .trm-sub-overlay {
+            bottom: 14px !important;
+        }
+        .plyr.trm-fs-active:not(.plyr--hide-controls) .trm-sub-overlay,
+        .plyr--fullscreen-active:not(.plyr--hide-controls) .trm-sub-overlay {
+            bottom: 48px !important;
+        }
+        .plyr.trm-fs-active.trm-screen-locked .trm-sub-overlay,
+        .plyr--fullscreen-active.trm-screen-locked .trm-sub-overlay,
+        .plyr.trm-screen-locked .trm-sub-overlay {
+            bottom: 14px !important;
+        }
+        .trm-sub-overlay span {
+            background: transparent !important;
+            color: #ffffff;
+            font-family: sans-serif;
+            font-size: clamp(13px, 3.5vw, 18px);
+            font-weight: 700;
+            line-height: 1.35;
+            padding: 0 6px;
+            white-space: pre-wrap;
+            text-shadow:
+                -1.5px -1.5px 0 #000,
+                 1.5px -1.5px 0 #000,
+                -1.5px  1.5px 0 #000,
+                 1.5px  1.5px 0 #000,
+                 0px    2px   5px rgba(0, 0, 0, 0.95);
+            max-width: 94%%;
+        }
+        .plyr.trm-fs-active .trm-sub-overlay span,
+        .plyr--fullscreen-active .trm-sub-overlay span {
+            font-size: clamp(16px, 3.1vw, 25px);
+        }
+        .trm-sub-overlay[hidden] { display: none !important; }
+
+        video::cue { opacity: 0; }
+
+        /* ---------------------------------------------------------------
+           SCREEN LOCK BUTTON
+           Shown only while .trm-fs-active, vertically centered on the RIGHT
+           edge. A perfect 44x44 circle (999px radius, fixed size, 1:1).
+           Fades out together with the controls (plyr--hide-controls) and
+           fades back in when the screen is tapped.
+           --------------------------------------------------------------- */
+        .trm-lock-btn {
+            display: none;
+            position: absolute;
+            right: calc(20px + env(safe-area-inset-right, 0px));
+            top: 50%%;
+            transform: translateY(-50%%);
+            z-index: 36;
+            width: 44px !important;
+            height: 44px !important;
+            min-width: 44px !important;
+            min-height: 44px !important;
+            max-width: 44px !important;
+            max-height: 44px !important;
+            aspect-ratio: 1 / 1 !important;
+            box-sizing: border-box !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            line-height: 0;
+            border-radius: 999px !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.35);
+            background: rgba(12, 16, 26, 0.72);
+            color: #ffffff;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            -webkit-backdrop-filter: blur(4px);
+            backdrop-filter: blur(4px);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transition: opacity 0.25s ease, visibility 0.25s ease, transform 0.15s ease;
+        }
+        .trm-lock-btn:active {
+            transform: translateY(-50%%) scale(0.92);
+        }
+        .trm-lock-btn svg {
+            width: 20px;
+            height: 20px;
+            display: block;
+            flex-shrink: 0;
+            fill: currentColor;
+        }
+        .plyr.trm-fs-active .trm-lock-btn {
+            display: flex;
+        }
+        .plyr.trm-fs-active:not(.trm-screen-locked):not(.plyr--hide-controls) .trm-lock-btn {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+        }
+
+        /* Touch Shield when Screen is Locked in Fullscreen */
+        .trm-lock-shield {
+            display: none;
+            position: absolute;
+            inset: 0;
+            z-index: 45;
+            background: transparent;
+            align-items: flex-end;
+            justify-content: center;
+            padding-bottom: calc(28px + env(safe-area-inset-bottom, 0px));
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        .plyr.trm-screen-locked .trm-lock-shield {
+            display: flex;
+        }
+        .plyr.trm-screen-locked .plyr__controls,
+        .plyr.trm-screen-locked .plyr__control--overlaid {
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
+
+        /* "SWIPE TO UNLOCK" Pill */
+        .trm-unlock-pill {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: rgba(18, 20, 26, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            border-radius: 40px;
+            padding: 6px 20px 6px 6px;
+            color: #ffffff;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            cursor: pointer;
+            touch-action: none;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.8);
+            transition: opacity 0.25s ease, transform 0.2s ease;
+        }
+        .trm-unlock-pill.is-hidden {
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(10px);
+        }
+        .trm-unlock-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%%;
+            background: #ffffff;
+            color: #000000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: transform 0.18s ease;
+        }
+        .trm-unlock-icon.is-dragging {
+            transition: none;
+        }
+        .trm-unlock-icon svg {
+            width: 18px;
+            height: 18px;
+            fill: currentColor;
+        }
+
+        /* Inspector panel: hidden unless the page URL has ?debug=1 */
+        .trm-diag-box {
+            display: none;
+            width: 90%%;
+            max-width: 400px;
+            margin: 10px auto 0 auto;
+            background: #0c1222;
+            border: 1px solid #00e5ff;
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-family: monospace;
+            font-size: 11px;
+            color: #00ff88;
+            line-height: 1.45;
+            word-break: break-word;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+        .trm-diag-box.is-on { display: block; }
+        .trm-diag-box.is-err {
+            border-color: #ff3355;
+            background: #1f0910;
+            color: #ff8095;
+        }
+        .trm-diag-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: bold;
+            color: #00e5ff;
+            margin-bottom: 4px;
+            border-bottom: 1px solid rgba(255,255,255,0.12);
+            padding-bottom: 4px;
+        }
+        .trm-copy-btn {
+            background: #00e5ff;
+            color: #000;
+            border: none;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 10px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .trm-diag-log {
+            max-height: 220px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            font-size: 10.5px;
+            color: #cfd8ff;
+        }
+
+        .trm-engine-shield {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            z-index: 60;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.62);
+            color: #00e5ff;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none;
+        }
+        .trm-engine-shield[hidden] { display: none !important; }
+        .trm-engine-spin {
+            width: 28px;
+            height: 28px;
+            border: 3px solid rgba(0, 229, 255, 0.25);
+            border-top-color: #00e5ff;
+            border-radius: 50px;
+            animation: trmEngineSpin 0.8s linear infinite;
+        }
+        @keyframes trmEngineSpin { to { transform: rotate(360deg); } }
+        .adx-audio .plyr__menu__container { max-height: 150px; overflow-y: auto; }
+        .adx-audio [role="menuitemradio"] > span { white-space: normal; text-align: left; max-width: 230px; }
+        .adx-audio .plyr__menu__container[hidden] { display: none; }
+        .adx-audio .adx-title,
+        .adx-audio .adx-status {
+            padding: 4px 10px;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            opacity: 0.75;
+            white-space: normal;
+            max-width: 220px;
+        }
+        .adx-audio .adx-status { text-transform: none; opacity: 0.95; letter-spacing: 0; color: #00e5ff; word-break: break-word; }
+        .adx-audio .adx-status[hidden] { display: none; }
+        .adx-audio .adx-busy { opacity: 0.6; pointer-events: none; }
+    </style>
 </head>
 <body>
 
@@ -199,6 +603,14 @@
         <video id="main-video" class="player" playsinline controls>
             <source src="%s" type="video/mp4" />
         </video>
+    </div>
+
+    <div id="trm-diag-box" class="trm-diag-box">
+        <div class="trm-diag-header">
+            <span id="trm-diag-step">TRM 5.1 Inspector: Initializing...</span>
+            <button type="button" id="trm-copy-btn" class="trm-copy-btn">Copy Log</button>
+        </div>
+        <div id="trm-diag-log" class="trm-diag-log">Waiting for MKV track metadata...</div>
     </div>
 
     <div class="choose-option">
@@ -216,8 +628,11 @@
     <div class="footer-slice"></div>
 
     <script src="https://cdn.plyr.io/3.6.12/plyr.js"></script>
+    <!--TRM_PLAYER_UI-->
     <script>
+        // Fallback: the original player. Runs only when the engine player (player-ui.js) did not start.
         document.addEventListener('DOMContentLoaded', () => {
+            if (window.__trmPlayer) return;
             const player = new Plyr('.player', {
                 controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'fullscreen']
             });
