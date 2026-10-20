@@ -130,7 +130,7 @@
         function nowMs() { return Math.round(performance.now()); }
         trmReport('AUDIO STARTUP', 'inspector script started at +' + nowMs() + 'ms since page load (debug=' + DEBUG + ')', false);
 
-        trmReport('BUILD', 'player-ui.js build 2026-10-20.2 | subtitle overlay fix | container sniff + native/engine routing | batches 4/12/45 | chunks 512KB then 3MB | shield + seek/switch/underrun hold', false);
+        trmReport('BUILD', 'player-ui.js build 2026-10-20.3 | subtitle overlay + native-audio subtitle seek fix | container sniff + native/engine routing | batches 4/12/45 | chunks 512KB then 3MB | shield + seek/switch/underrun hold', false);
         if (!video) return;
         video.addEventListener('error', function () {
             var er = video.error;
@@ -2380,6 +2380,7 @@
             var subMenuApi = null;
             var subMainFrom = null, subMainTo = null;   // demux time range covered by the main (shared) stream since its last restart
             var subHealGen = -1, subWatchGen = -1, subWatchAt = 0;
+            var subLastStart = 0, subLastAuto = 0, subLagSince = 0;   // standalone (native audio) scan supervisor
 
             var subBaseIdx = -1;
             if (subs.length) {
@@ -2507,6 +2508,22 @@
                         subScan(video.currentTime - 10, null, g0, true);
                     }
                 }
+                // Native audio: keep the subtitle scan alive and near the playhead (it can fail, stall or fall behind).
+                if (!active && !engineBusy && sub.cur >= 0 && !video.paused && !video.seeking) {
+                    var nowT = performance.now();
+                    var vtn = video.currentTime;
+                    if (nowT - subLastStart > 5000 && nowT - subLastAuto > 4000) {
+                        var behind = sub.alive && sub.scan < vtn - 4;
+                        var outside = vtn < sub.covFrom - 1 || vtn > sub.scan + 2;
+                        var nearEnd = !!(META.dur && vtn > META.dur - 20);
+                        if (behind) { if (!subLagSince) subLagSince = nowT; } else { subLagSince = 0; }
+                        if ((!sub.alive && outside && !nearEnd) || (behind && nowT - subLagSince > 4000)) {
+                            subLastAuto = nowT;
+                            subLagSince = 0;
+                            subStandaloneRestart(sub.alive ? 'scan fell behind the video' : 'scan stopped before the playhead');
+                        }
+                    }
+                }
                 if (!active || sub.cur < 0 || video.paused || video.seeking || !engineReady) return;
                 if (subWatchGen !== gen) { subWatchGen = gen; subWatchAt = performance.now(); }
                 if (subHealGen === gen || performance.now() - subWatchAt < 2500) return;
@@ -2571,6 +2588,7 @@
             }
 
             async function subScan(from, until, g, solo) {
+                subLastStart = performance.now();
                 try { await loadCues(); } catch (e) {}
                 if (g !== sub.gen || sub.cur < 0) return;
                 from = Math.max(0, from);
@@ -2615,6 +2633,16 @@
                 renderSubOverlay();
             }
 
+            // Native-audio mode: (re)start the subtitle-only scan at the playhead.
+            function subStandaloneRestart(reason) {
+                if (sub.cur < 0 || active || engineBusy) return;
+                var t = video.currentTime;
+                subAbortScan();
+                var g = ++sub.gen;
+                trmReport('SUBS: RESYNC', reason + ' -> scanning from ' + Math.max(0, t - 6).toFixed(1) + 's', false);
+                subScan(t - 6, null, g, true);
+            }
+
             function subCatchUp(g) {
                 var vt = video.currentTime;
                 var until = Math.max(vt + 12, lastTs + 2);
@@ -2646,17 +2674,29 @@
                 }
             }
 
+            // Native audio: after a seek the old scan is stopped at once (so the <video> gets the bandwidth first),
+            // and a new scan starts at the new position as soon as the video has finished seeking.
+            function subSeekScan() {
+                if (sub.cur < 0 || active || engineBusy) return;
+                var t = video.currentTime;
+                if (sub.alive && t >= sub.covFrom && t <= sub.scan + 1) return;
+                subStandaloneRestart('seek');
+            }
             video.addEventListener('seeking', function () {
                 if (sub.cur < 0 || active || engineBusy) return;
+                var t = video.currentTime;
                 clearTimeout(sub.timer);
-                sub.timer = setTimeout(function () {
-                    if (sub.cur < 0 || active || engineBusy) return;
-                    var t = video.currentTime;
-                    if (sub.alive && t >= sub.covFrom && t <= sub.scan + 1) return;
-                    abortSub();
-                    var g = ++sub.gen;
-                    subScan(t - 10, null, g, true);
-                }, 250);
+                if (sub.alive && t >= sub.covFrom && t <= sub.scan + 1) return;   // target already covered
+                abortSub();
+                sub.gen++;
+                sub.alive = false;
+                sub.timer = setTimeout(subSeekScan, 3000);   // fallback if 'seeked' never arrives
+            });
+            video.addEventListener('seeked', function () {
+                if (sub.cur < 0 || active || engineBusy) return;
+                if (sub.alive) return;
+                clearTimeout(sub.timer);
+                sub.timer = setTimeout(subSeekScan, 250);
             });
 
             // Starts the default subtitle track. When the audio engine is needed, this waits for the
