@@ -45,6 +45,13 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DL_HTML_PATH = os.path.join(BASE_DIR, "dl.html")
+
+# Browser side of the player (Plyr + 5.1 audio engine + subtitles). It is read from disk and inlined into
+# the /watch page at the marker below, so it is served from the SAME domain as the page (the Worker proxies
+# /watch/), and Render is never exposed to the browser. If the file is missing the marker stays an inert
+# HTML comment and dl.html's built-in original player runs instead.
+PLAYER_UI_PATH = os.path.join(BASE_DIR, "player-ui.js")
+PLAYER_UI_MARKER = "<!--TRM_PLAYER_UI-->"
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 
 URL_REGEX = re.compile(r"^https?://\S+$", re.IGNORECASE)
@@ -1084,6 +1091,40 @@ async def webhook_handler(request: web.Request) -> web.Response:
     return web.Response(status=200, text="OK")
 
 
+# mtime -> inlined <script> block, so the file is only re-read when it changes.
+_player_ui_cache: dict = {"mtime": None, "html": None}
+
+
+def load_player_ui_script() -> str | None:
+    """Returns the player-ui.js code wrapped in a <script> tag, or None when the file is not available."""
+    try:
+        mtime = os.path.getmtime(PLAYER_UI_PATH)
+    except OSError:
+        return None
+    if _player_ui_cache["mtime"] != mtime:
+        try:
+            with open(PLAYER_UI_PATH, "r", encoding="utf-8") as f:
+                code = f.read()
+        except OSError:
+            return None
+        # The code must never be able to close the surrounding <script> tag early.
+        code = code.replace("</script", "<\\/script")
+        _player_ui_cache["mtime"] = mtime
+        _player_ui_cache["html"] = "<script>\n" + code + "\n</script>"
+    return _player_ui_cache["html"]
+
+
+def inject_player_ui(rendered: str) -> str:
+    """Inlines player-ui.js at the marker. Done AFTER the % formatting, because the JS contains % characters."""
+    if PLAYER_UI_MARKER not in rendered:
+        return rendered
+    script = load_player_ui_script()
+    if script is None:
+        logger.warning("[PLAYER] player-ui.js not found next to the bot - the original built-in player is used")
+        return rendered
+    return rendered.replace(PLAYER_UI_MARKER, script, 1)
+
+
 async def watch_handler(request: web.Request) -> web.Response:
     short_id = request.match_info.get("id", "")
 
@@ -1149,7 +1190,14 @@ async def watch_handler(request: web.Request) -> web.Response:
     except TypeError as e:
         return web.Response(status=500, text=f"Template formatting error: {e}")
 
-    return web.Response(text=rendered, content_type="text/html")
+    rendered = inject_player_ui(rendered)
+
+    # no-store: a player update must show up on the very next page load, never from an old cached copy.
+    return web.Response(
+        text=rendered,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def health_handler(request: web.Request) -> web.Response:
