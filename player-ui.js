@@ -130,7 +130,7 @@
         function nowMs() { return Math.round(performance.now()); }
         trmReport('AUDIO STARTUP', 'inspector script started at +' + nowMs() + 'ms since page load (debug=' + DEBUG + ')', false);
 
-        trmReport('BUILD', 'player-ui.js build 2026-10-20.1 | container sniff + native/engine routing | batches 4/12/45 | chunks 512KB then 3MB | shield + seek/switch/underrun hold', false);
+        trmReport('BUILD', 'player-ui.js build 2026-10-20.2 | subtitle overlay fix | container sniff + native/engine routing | batches 4/12/45 | chunks 512KB then 3MB | shield + seek/switch/underrun hold', false);
         if (!video) return;
         video.addEventListener('error', function () {
             var er = video.error;
@@ -2206,6 +2206,8 @@
                 var frameDur = frameDurFor(track);
                 lastTs = t;
                 audioEnded = false;
+                subMainFrom = null;
+                subMainTo = null;
                 try {
                     await demuxCore({
                         tag: 'STEP 5: DEMUX STREAM',
@@ -2229,6 +2231,11 @@
                                 if (!video.paused && fts < video.currentTime - 0.15) continue;
                                 decoder.push(frames[fi], fts);
                             }
+                        },
+                        onScan: function (ts) {
+                            if (g !== gen) return;
+                            if (subMainFrom === null) subMainFrom = ts;
+                            subMainTo = ts;
                         },
                         onSub: function (trId, ts, dur, bytes) { subAdd(trId, ts, dur, bytes); },
                         onEnd: function () {
@@ -2347,6 +2354,7 @@
                     if (!subAutoDone && subBaseIdx >= 0) {
                         subAutoDone = true;
                         sub.cur = subBaseIdx;
+                        subWanted = subBaseIdx;
                         ensureSubOverlay();
                         trmReport('SUBS: ON', 'Track #' + (subBaseIdx + 1) + ' ' + subLabelList[subBaseIdx] + ' (shared with audio demux stream)', false);
                     }
@@ -2366,6 +2374,12 @@
             subs.forEach(function (s) { subById[s.id] = s; });
             var subLabelList = subLabels();
             var subAutoDone = false;
+            // The subtitle track the user (or the auto start) chose. Only the menu may change it; a guard restores it if
+            // anything else ever resets sub.cur.   -2 = nothing chosen yet, -1 = user chose Off, >= 0 = track index.
+            var subWanted = -2;
+            var subMenuApi = null;
+            var subMainFrom = null, subMainTo = null;   // demux time range covered by the main (shared) stream since its last restart
+            var subHealGen = -1, subWatchGen = -1, subWatchAt = 0;
 
             var subBaseIdx = -1;
             if (subs.length) {
@@ -2375,18 +2389,60 @@
                 }
             }
 
+            // Crisp subtitle text. Injected from here so every page (test Worker and the Render dl.html) gets it.
+            function injectSubStyle() {
+                if (document.getElementById('trm-sub-style')) return;
+                var st = document.createElement('style');
+                st.id = 'trm-sub-style';
+                st.textContent = [
+                    '.trm-sub-overlay { position: absolute; z-index: 40; pointer-events: none; display: flex; justify-content: center; align-items: flex-end; transform: none !important; will-change: auto; opacity: 1; visibility: visible; }',
+                    '.trm-sub-overlay[hidden] { display: none !important; }',
+                    '.trm-sub-overlay span {',
+                    '  background: transparent !important; color: #fff; font-weight: 700; line-height: 1.3; padding: 0 6px; text-align: center; white-space: pre-wrap; max-width: 94%;',
+                    '  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Noto Sans Tamil", "Noto Sans Telugu", "Noto Sans Devanagari", Arial, sans-serif;',
+                    '  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: geometricPrecision; font-kerning: normal;',
+                    '  text-shadow: -1px 0 #000, 1px 0 #000, 0 -1px #000, 0 1px #000, -1px -1px #000, 1px -1px #000, -1px 1px #000, 1px 1px #000, 0 2px 2px rgba(0, 0, 0, 0.55);',
+                    '}'
+                ].join('\n');
+                (document.head || document.documentElement).appendChild(st);
+            }
+
+            // Whole-pixel font size from the real player size (windowed, fullscreen, zoom), so glyphs are never rasterised at a fraction of a pixel.
+            function fitSubFont() {
+                if (!sub.spanEl) return;
+                var host = sub.overlayEl && sub.overlayEl.parentNode;
+                var w = (host && host.clientWidth) || window.innerWidth;
+                var h = (host && host.clientHeight) || window.innerHeight;
+                var px = Math.round(Math.max(13, Math.min(w * 0.045, h * 0.075, 34)));
+                sub.spanEl.style.setProperty('font-size', px + 'px', 'important');
+                sub.spanEl.style.setProperty('letter-spacing', '0', 'important');
+                sub.overlayEl.style.setProperty('left', Math.round(w * 0.05) + 'px', 'important');
+                sub.overlayEl.style.setProperty('right', Math.round(w * 0.05) + 'px', 'important');
+            }
+
+            // The overlay MUST live inside the .plyr element: only that element goes fullscreen / gets the zoom layout.
+            // It can be created before Plyr has built its player, so it is (re)attached to .plyr whenever that exists.
             function ensureSubOverlay() {
-                if (sub.overlayEl) return;
-                var host = video.closest('.plyr') || video.parentElement;
-                if (!host) return;
-                var div = document.createElement('div');
-                div.className = 'trm-sub-overlay';
-                div.hidden = true;
-                var sp = document.createElement('span');
-                div.appendChild(sp);
-                host.appendChild(div);
-                sub.overlayEl = div;
-                sub.spanEl = sp;
+                injectSubStyle();
+                if (!sub.overlayEl) {
+                    var div = document.createElement('div');
+                    div.className = 'trm-sub-overlay';
+                    div.hidden = true;
+                    var sp = document.createElement('span');
+                    div.appendChild(sp);
+                    sub.overlayEl = div;
+                    sub.spanEl = sp;
+                }
+                var host = video.closest('.plyr');
+                if (host) {
+                    if (sub.overlayEl.parentNode !== host) {
+                        host.appendChild(sub.overlayEl);
+                        fitSubFont();
+                    }
+                } else if (!sub.overlayEl.parentNode && video.parentElement) {
+                    video.parentElement.appendChild(sub.overlayEl);
+                    fitSubFont();
+                }
             }
 
             function renderSubOverlay() {
@@ -2417,6 +2473,54 @@
             }
 
             video.addEventListener('timeupdate', renderSubOverlay);
+
+            // Keep the overlay attached, sized and visible through fullscreen, zoom modes, rotation and resizes.
+            function relayoutSubs() {
+                ensureSubOverlay();
+                fitSubFont();
+                renderSubOverlay();
+            }
+            ['fullscreenchange', 'webkitfullscreenchange'].forEach(function (evn) {
+                document.addEventListener(evn, function () {
+                    relayoutSubs();
+                    setTimeout(relayoutSubs, 200);
+                    setTimeout(relayoutSubs, 700);
+                });
+            });
+            window.addEventListener('resize', relayoutSubs);
+            window.addEventListener('orientationchange', function () { setTimeout(relayoutSubs, 250); });
+            video.addEventListener('loadedmetadata', relayoutSubs);
+
+            // Subtitle guard: the chosen track stays locked, and the cues around the playhead are kept in sync after seeks.
+            function subGuardTick() {
+                if (sub.cur >= 0 || subWanted >= 0) ensureSubOverlay();
+                if (subWanted >= 0 && sub.cur !== subWanted) {
+                    trmReport('SUBS: RESTORED', 'track #' + (subWanted + 1) + ' had been reset (cur=' + sub.cur + ') by something other than the menu - locked back on', true);
+                    sub.cur = subWanted;
+                    if (subMenuApi) subMenuApi.setChecked(subWanted + 1);
+                    renderSubOverlay();
+                    if (active) {
+                        subHealGen = -1;
+                    } else if (!engineBusy) {
+                        subAbortScan();
+                        var g0 = ++sub.gen;
+                        subScan(video.currentTime - 10, null, g0, true);
+                    }
+                }
+                if (!active || sub.cur < 0 || video.paused || video.seeking || !engineReady) return;
+                if (subWatchGen !== gen) { subWatchGen = gen; subWatchAt = performance.now(); }
+                if (subHealGen === gen || performance.now() - subWatchAt < 2500) return;
+                var vt = video.currentTime;
+                var covered = subMainFrom !== null && vt >= subMainFrom - 1 && vt <= subMainTo + 2;
+                if (!covered) {
+                    subHealGen = gen;
+                    trmReport('SUBS: RESYNC', 'main stream covers ' + (subMainFrom === null ? 'nothing yet' : subMainFrom.toFixed(1) + 's..' + subMainTo.toFixed(1) + 's') + ' but video=' + vt.toFixed(1) + 's - loading the missing subtitle lines', false);
+                    subAbortScan();
+                    var g1 = ++sub.gen;
+                    subCatchUp(g1);
+                }
+            }
+            video.addEventListener('seeked', function () { subGuardTick(); });
 
             function decodeSubText(codec, bytes) {
                 var raw = new TextDecoder('utf-8').decode(bytes).replace(/\r/g, '').replace(/\0+$/g, '');
@@ -2519,6 +2623,7 @@
 
             async function subSelect(i) {
                 subAutoDone = true;
+                subWanted = i;   // -1 = Off. Only an explicit menu choice (or the auto start) ever changes this.
                 subStop();
                 if (i < 0) {
                     trmReport('SUBS: OFF', 'Subtitles disabled', false);
@@ -2567,6 +2672,7 @@
                 if (active || engineBusy) {
                     subAutoDone = true;
                     sub.cur = subBaseIdx;
+                    subWanted = subBaseIdx;
                     ensureSubOverlay();
                     renderSubOverlay();
                     trmReport('SUBS: ON', 'Track #' + (subBaseIdx + 1) + ' ' + subLabelList[subBaseIdx] + ' (shared with audio demux stream)', false);
@@ -2578,6 +2684,8 @@
                     trmReport('SUBS: AUTO START FAILED', formatErr(e), true);
                 });
             }
+
+            setInterval(subGuardTick, 1000);
 
             window.addEventListener('pagehide', function () {
                 abortDemux();
@@ -2858,11 +2966,15 @@
                 var fs = controls.querySelector('.trm-zoom-ctrl') || controls.querySelector('[data-plyr="fullscreen"]');
                 if (fs && fs.parentNode) fs.parentNode.insertBefore(wrap, fs); else controls.appendChild(wrap);
 
-                return { setStatus: setStatus };
+                return {
+                    setStatus: setStatus,
+                    setChecked: function (idx) { cur = idx; setChecked(idx); }
+                };
             }
 
             function buildMenus(controls) {
                 mountLockAndZoomUI(controls);
+                ensureSubOverlay();
                 if (controls.querySelector('.adx-audio')) return;
 
                 var aLabels = uniqueLabels();
@@ -2901,9 +3013,11 @@
                         }
                     });
                     subStatusCb = subMenu.setStatus;
+                    subMenuApi = subMenu;
                 }
             }
 
+            waitFor('.plyr', 100, function () { ensureSubOverlay(); });
             waitFor('.plyr__controls', 60, buildMenus);
         }
 
@@ -2929,4 +3043,3 @@
             });
         }
     })();
-
